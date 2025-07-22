@@ -838,91 +838,37 @@ fn process_input(
     stream.channel.io_bytes().readi(buffer)?;
     let sample_format = stream.sample_format;
 
-    if sample_format == SampleFormat::I24 {
-        // ALSA S24_3LE uses 3 bytes per sample, but I24 expects 4 bytes
+    let (data, len) = if sample_format == SampleFormat::I24 {
+        // Put the 3 bytes into a regular 4 bytes structure
         let num_samples = buffer.len() / 3;
+        for i in 0..num_samples {
+            let src_offset = i * 3;
+            let dst_offset = i * 4;
 
-        // Convert from packed 24-bit to unpacked 32-bit
-        // Process in chunks for better cache efficiency
-        const CHUNK_SIZE: usize = 64; // Process 64 samples at a time
-        let chunks = num_samples / CHUNK_SIZE;
-        let remainder = num_samples % CHUNK_SIZE;
+            let src = &buffer[src_offset..src_offset + 3];
+            let dst = &mut temp_buffer[dst_offset..dst_offset + 4];
 
-        unsafe {
-            let src_ptr = buffer.as_ptr();
-            let dst_ptr = temp_buffer.as_mut_ptr();
-
-            // Process full chunks
-            for chunk in 0..chunks {
-                let base_src = chunk * CHUNK_SIZE * 3;
-                let base_dst = chunk * CHUNK_SIZE * 4;
-
-                for i in 0..CHUNK_SIZE {
-                    let src_offset = base_src + i * 3;
-                    let dst_offset = base_dst + i * 4;
-
-                    // Copy 3 bytes
-                    *dst_ptr.add(dst_offset) = *src_ptr.add(src_offset);
-                    *dst_ptr.add(dst_offset + 1) = *src_ptr.add(src_offset + 1);
-                    *dst_ptr.add(dst_offset + 2) = *src_ptr.add(src_offset + 2);
-
-                    // Sign extension
-                    *dst_ptr.add(dst_offset + 3) = if *src_ptr.add(src_offset + 2) & 0x80 != 0 {
-                        0xFF
-                    } else {
-                        0x00
-                    };
-                }
-            }
-
-            // Process remainder
-            let base_src = chunks * CHUNK_SIZE * 3;
-            let base_dst = chunks * CHUNK_SIZE * 4;
-
-            for i in 0..remainder {
-                let src_offset = base_src + i * 3;
-                let dst_offset = base_dst + i * 4;
-
-                *dst_ptr.add(dst_offset) = *src_ptr.add(src_offset);
-                *dst_ptr.add(dst_offset + 1) = *src_ptr.add(src_offset + 1);
-                *dst_ptr.add(dst_offset + 2) = *src_ptr.add(src_offset + 2);
-                *dst_ptr.add(dst_offset + 3) = if *src_ptr.add(src_offset + 2) & 0x80 != 0 {
-                    0xFF
-                } else {
-                    0x00
-                };
-            }
-
-            // Create Data from conversion buffer
-            let data_ptr = temp_buffer.as_ptr() as *mut ();
-            let data = unsafe { Data::from_parts(data_ptr, num_samples, sample_format) };
-            let callback = stream_timestamp(&status, stream.creation_instant)?;
-            let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
-            let capture = callback
-                .sub(delay_duration)
-                .expect("`capture` is earlier than representation supported by `StreamInstant`");
-            let timestamp = crate::InputStreamTimestamp { callback, capture };
-            let info = crate::InputCallbackInfo { timestamp };
-
-            // Call the callback while the conversion buffer is still borrowed
-            data_callback(&data, &info);
-            Ok(())
+            // Fill 3 bytes with the data
+            dst[..3].copy_from_slice(src);
+            // Sign-extend the 24-bit sample to 32 bits
+            dst[3] = if src[2] & 0x80 != 0 { 0xFF } else { 0x00 };
         }
+        (temp_buffer.as_ptr() as *mut (), num_samples)
     } else {
-        let data_ptr = buffer.as_mut_ptr() as *mut ();
         let len = buffer.len() / sample_format.sample_size();
-        let data = unsafe { Data::from_parts(data_ptr, len, sample_format) };
+        (buffer.as_mut_ptr() as *mut (), len)
+    };
 
-        let callback = stream_timestamp(&status, stream.creation_instant)?;
-        let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
-        let capture = callback
-            .sub(delay_duration)
-            .expect("`capture` is earlier than representation supported by `StreamInstant`");
-        let timestamp = crate::InputStreamTimestamp { callback, capture };
-        let info = crate::InputCallbackInfo { timestamp };
-        data_callback(&data, &info);
-        Ok(())
-    }
+    let data = unsafe { Data::from_parts(data, len, sample_format) };
+    let callback = stream_timestamp(&status, stream.creation_instant)?;
+    let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
+    let capture = callback
+        .sub(delay_duration)
+        .expect("`capture` is earlier than representation supported by `StreamInstant`");
+    let timestamp = crate::InputStreamTimestamp { callback, capture };
+    let info = crate::InputCallbackInfo { timestamp };
+    data_callback(&data, &info);
+    Ok(())
 }
 
 // Request data from the user's function and write it via ALSA.
