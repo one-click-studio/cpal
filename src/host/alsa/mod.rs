@@ -326,7 +326,7 @@ impl Device {
         let hw_params = alsa::pcm::HwParams::any(handle)?;
 
         // TODO: check endianness
-        const FORMATS: [(SampleFormat, alsa::pcm::Format); 8] = [
+        const FORMATS: [(SampleFormat, alsa::pcm::Format); 9] = [
             (SampleFormat::I8, alsa::pcm::Format::S8),
             (SampleFormat::U8, alsa::pcm::Format::U8),
             (SampleFormat::I16, alsa::pcm::Format::S16LE),
@@ -354,6 +354,7 @@ impl Device {
             //SND_PCM_FORMAT_GSM,
             //SND_PCM_FORMAT_SPECIAL,
             //SND_PCM_FORMAT_S24_3LE,
+            (SampleFormat::I24, alsa::pcm::Format::S243LE),
             //SND_PCM_FORMAT_S24_3BE,
             //SND_PCM_FORMAT_U24_3LE,
             //SND_PCM_FORMAT_U24_3BE,
@@ -774,8 +775,8 @@ fn poll_descriptors_and_prepare_buffer(
 
     let revents = stream.channel.revents(&descriptors[1..])?;
     if revents.contains(alsa::poll::Flags::ERR) {
-        let description = String::from("`alsa::poll()` returned POLLERR");
-        return Err(BackendSpecificError { description });
+        // POLLERR indicates a serious error. Try to recover by treating it as an XRun
+        return Ok(PollDescriptorsFlow::XRun);
     }
     let stream_type = match revents {
         alsa::poll::Flags::OUT => StreamType::Output,
@@ -804,7 +805,12 @@ fn poll_descriptors_and_prepare_buffer(
     }
 
     // Prepare the data buffer.
-    let buffer_size = stream.sample_format.sample_size() * available_samples;
+    // For S24_3LE format, ALSA uses 3 bytes per sample
+    let buffer_size = if stream.sample_format == SampleFormat::I24 {
+        3 * available_samples
+    } else {
+        stream.sample_format.sample_size() * available_samples
+    };
     buffer.resize(buffer_size, 0u8);
 
     Ok(PollDescriptorsFlow::Ready {
@@ -813,6 +819,13 @@ fn poll_descriptors_and_prepare_buffer(
         avail_frames,
         delay_frames,
     })
+}
+
+// Thread-local storage for I24 conversion buffers to avoid allocations
+// We use double buffering to ensure data stability
+thread_local! {
+    static I24_CONVERSION_BUFFERS: std::cell::RefCell<(Vec<u8>, Vec<u8>, bool)> = 
+        std::cell::RefCell::new((Vec::with_capacity(192000), Vec::with_capacity(192000), false));
 }
 
 // Read input data from ALSA and deliver it to the user.
@@ -825,19 +838,108 @@ fn process_input(
 ) -> Result<(), BackendSpecificError> {
     stream.channel.io_bytes().readi(buffer)?;
     let sample_format = stream.sample_format;
-    let data = buffer.as_mut_ptr() as *mut ();
-    let len = buffer.len() / sample_format.sample_size();
-    let data = unsafe { Data::from_parts(data, len, sample_format) };
-    let callback = stream_timestamp(&status, stream.creation_instant)?;
-    let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
-    let capture = callback
-        .sub(delay_duration)
-        .expect("`capture` is earlier than representation supported by `StreamInstant`");
-    let timestamp = crate::InputStreamTimestamp { callback, capture };
-    let info = crate::InputCallbackInfo { timestamp };
-    data_callback(&data, &info);
 
-    Ok(())
+    if sample_format == SampleFormat::I24 {
+        // ALSA S24_3LE uses 3 bytes per sample, but I24 expects 4 bytes
+        let num_samples = buffer.len() / 3;
+        let needed_size = num_samples * 4;
+
+        I24_CONVERSION_BUFFERS.with(|buffers| {
+            let mut buffers = buffers.borrow_mut();
+            let (ref mut buf1, ref mut buf2, ref mut use_second) = *buffers;
+            
+            // Select current buffer and prepare it
+            let conversion_buf = if *use_second { buf2 } else { buf1 };
+            *use_second = !*use_second; // Toggle for next time
+            
+            // Ensure buffer is large enough
+            if conversion_buf.capacity() < needed_size {
+                conversion_buf.reserve(needed_size - conversion_buf.capacity());
+            }
+            conversion_buf.resize(needed_size, 0);
+
+            // Convert from packed 24-bit to unpacked 32-bit
+            // Process in chunks for better cache efficiency
+            const CHUNK_SIZE: usize = 64; // Process 64 samples at a time
+            let chunks = num_samples / CHUNK_SIZE;
+            let remainder = num_samples % CHUNK_SIZE;
+            
+            unsafe {
+                let src_ptr = buffer.as_ptr();
+                let dst_ptr = conversion_buf.as_mut_ptr();
+                
+                // Process full chunks
+                for chunk in 0..chunks {
+                    let base_src = chunk * CHUNK_SIZE * 3;
+                    let base_dst = chunk * CHUNK_SIZE * 4;
+                    
+                    for i in 0..CHUNK_SIZE {
+                        let src_offset = base_src + i * 3;
+                        let dst_offset = base_dst + i * 4;
+                        
+                        // Copy 3 bytes
+                        *dst_ptr.add(dst_offset) = *src_ptr.add(src_offset);
+                        *dst_ptr.add(dst_offset + 1) = *src_ptr.add(src_offset + 1);
+                        *dst_ptr.add(dst_offset + 2) = *src_ptr.add(src_offset + 2);
+                        
+                        // Sign extension
+                        *dst_ptr.add(dst_offset + 3) = if *src_ptr.add(src_offset + 2) & 0x80 != 0 {
+                            0xFF
+                        } else {
+                            0x00
+                        };
+                    }
+                }
+                
+                // Process remainder
+                let base_src = chunks * CHUNK_SIZE * 3;
+                let base_dst = chunks * CHUNK_SIZE * 4;
+                
+                for i in 0..remainder {
+                    let src_offset = base_src + i * 3;
+                    let dst_offset = base_dst + i * 4;
+                    
+                    *dst_ptr.add(dst_offset) = *src_ptr.add(src_offset);
+                    *dst_ptr.add(dst_offset + 1) = *src_ptr.add(src_offset + 1);
+                    *dst_ptr.add(dst_offset + 2) = *src_ptr.add(src_offset + 2);
+                    *dst_ptr.add(dst_offset + 3) = if *src_ptr.add(src_offset + 2) & 0x80 != 0 {
+                        0xFF
+                    } else {
+                        0x00
+                    };
+                }
+            }
+
+            // Create Data from conversion buffer
+            let data_ptr = conversion_buf.as_ptr() as *mut ();
+            let data = unsafe { Data::from_parts(data_ptr, num_samples, sample_format) };
+            let callback = stream_timestamp(&status, stream.creation_instant)?;
+            let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
+            let capture = callback
+                .sub(delay_duration)
+                .expect("`capture` is earlier than representation supported by `StreamInstant`");
+            let timestamp = crate::InputStreamTimestamp { callback, capture };
+            let info = crate::InputCallbackInfo { timestamp };
+
+            // Call the callback while the conversion buffer is still borrowed
+            data_callback(&data, &info);
+            Ok(())
+        })
+    } else {
+        let data_ptr = buffer.as_mut_ptr() as *mut ();
+        let len = buffer.len() / sample_format.sample_size();
+        let data = unsafe { Data::from_parts(data_ptr, len, sample_format) };
+
+        let callback = stream_timestamp(&status, stream.creation_instant)?;
+        let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
+        let capture = callback.sub(delay_duration).expect(
+            "`capture` is earlier than representation supported by `StreamInstant`",
+        );
+        let timestamp = crate::InputStreamTimestamp { callback, capture };
+        let info = crate::InputCallbackInfo { timestamp };
+        data_callback(&data, &info);
+        Ok(())
+    }
 }
 
 // Request data from the user's function and write it via ALSA.
@@ -856,8 +958,24 @@ fn process_output(
         // We're now sure that we're ready to write data.
         let sample_format = stream.sample_format;
         let data = buffer.as_mut_ptr() as *mut ();
-        let len = buffer.len() / sample_format.sample_size();
-        let mut data = unsafe { Data::from_parts(data, len, sample_format) };
+        let len = if sample_format == SampleFormat::I24 {
+            // For I24, the buffer is sized for 3 bytes per sample
+            buffer.len() / 3
+        } else {
+            buffer.len() / sample_format.sample_size()
+        };
+
+        // For I24 format, we need to provide a temporary buffer with 4 bytes per sample
+        let mut temp_buffer =
+            if sample_format == SampleFormat::I24 { vec![0u8; len * 4] } else { vec![] };
+
+        let (data_ptr, actual_len) = if sample_format == SampleFormat::I24 {
+            (temp_buffer.as_mut_ptr() as *mut (), len)
+        } else {
+            (data, len)
+        };
+
+        let mut data = unsafe { Data::from_parts(data_ptr, actual_len, sample_format) };
         let callback = stream_timestamp(&status, stream.creation_instant)?;
         let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
         let playback = callback
@@ -866,6 +984,18 @@ fn process_output(
         let timestamp = crate::OutputStreamTimestamp { callback, playback };
         let info = crate::OutputCallbackInfo { timestamp };
         data_callback(&mut data, &info);
+
+        // For I24, pack the 4-byte samples back to 3-byte format for ALSA
+        if sample_format == SampleFormat::I24 {
+            for i in 0..len {
+                let src_offset = i * 4;
+                let dst_offset = i * 3;
+                buffer[dst_offset] = temp_buffer[src_offset];
+                buffer[dst_offset + 1] = temp_buffer[src_offset + 1];
+                buffer[dst_offset + 2] = temp_buffer[src_offset + 2];
+                // Ignore the 4th byte (padding/sign extension)
+            }
+        }
     }
     loop {
         match stream.channel.io_bytes().writei(buffer) {
@@ -1053,6 +1183,7 @@ fn set_hw_params_from_format(
             SampleFormat::I8 => alsa::pcm::Format::S8,
             SampleFormat::I16 => alsa::pcm::Format::S16BE,
             // SampleFormat::I24 => alsa::pcm::Format::S24BE,
+            SampleFormat::I24 => alsa::pcm::Format::S243LE,
             SampleFormat::I32 => alsa::pcm::Format::S32BE,
             // SampleFormat::I48 => alsa::pcm::Format::S48BE,
             // SampleFormat::I64 => alsa::pcm::Format::S64BE,
@@ -1077,7 +1208,7 @@ fn set_hw_params_from_format(
         match sample_format {
             SampleFormat::I8 => alsa::pcm::Format::S8,
             SampleFormat::I16 => alsa::pcm::Format::S16LE,
-            // SampleFormat::I24 => alsa::pcm::Format::S24LE,
+            SampleFormat::I24 => alsa::pcm::Format::S243LE,
             SampleFormat::I32 => alsa::pcm::Format::S32LE,
             // SampleFormat::I48 => alsa::pcm::Format::S48LE,
             // SampleFormat::I64 => alsa::pcm::Format::S64LE,

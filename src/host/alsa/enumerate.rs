@@ -64,7 +64,7 @@ impl Iterator for Devices {
             // ...
             // For now, many hardware only support 24bit / 3 bytes, which isn't yet supported by
             // cpal. So we have to enable plughw (unfortunately) for maximum compatibility.
-            const USE_PLUGHW: bool = true;
+            const USE_PLUGHW: bool = false;
             let pcm_id = if USE_PLUGHW {
                 format!("plughw:{}", card.get_index())
             } else {
