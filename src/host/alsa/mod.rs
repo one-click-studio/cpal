@@ -564,6 +564,7 @@ pub struct Stream {
 struct StreamWorkerContext {
     descriptors: Vec<libc::pollfd>,
     buffer: Vec<u8>,
+    temp_buffer: Vec<u8>,
     poll_timeout: i32,
 }
 
@@ -578,6 +579,7 @@ impl StreamWorkerContext {
         Self {
             descriptors: Vec::new(),
             buffer: Vec::new(),
+            temp_buffer: Vec::new(),
             poll_timeout,
         }
     }
@@ -625,6 +627,7 @@ fn input_stream_worker(
                 if let Err(err) = process_input(
                     stream,
                     &mut ctxt.buffer,
+                    &mut ctxt.temp_buffer,
                     status,
                     delay_frames,
                     data_callback,
@@ -735,6 +738,7 @@ fn poll_descriptors_and_prepare_buffer(
     let StreamWorkerContext {
         ref mut descriptors,
         ref mut buffer,
+        ref mut temp_buffer,
         ref poll_timeout,
     } = *ctxt;
 
@@ -805,13 +809,14 @@ fn poll_descriptors_and_prepare_buffer(
     }
 
     // Prepare the data buffer.
-    // For S24_3LE format, ALSA uses 3 bytes per sample
-    let buffer_size = if stream.sample_format == SampleFormat::I24 {
-        3 * available_samples
+    if stream.sample_format == SampleFormat::I24 {
+        // For S24_3LE format, ALSA uses 3 bytes per sample
+        buffer.resize(3 * available_samples, 0u8);
+        temp_buffer.resize(4 * available_samples, 0u8);
     } else {
-        stream.sample_format.sample_size() * available_samples
-    };
-    buffer.resize(buffer_size, 0u8);
+        let buffer_size = stream.sample_format.sample_size() * available_samples;
+        buffer.resize(buffer_size, 0u8);
+    }
 
     Ok(PollDescriptorsFlow::Ready {
         stream_type,
@@ -821,17 +826,11 @@ fn poll_descriptors_and_prepare_buffer(
     })
 }
 
-// Thread-local storage for I24 conversion buffers to avoid allocations
-// We use double buffering to ensure data stability
-thread_local! {
-    static I24_CONVERSION_BUFFERS: std::cell::RefCell<(Vec<u8>, Vec<u8>, bool)> = 
-        std::cell::RefCell::new((Vec::with_capacity(192000), Vec::with_capacity(192000), false));
-}
-
 // Read input data from ALSA and deliver it to the user.
 fn process_input(
     stream: &StreamInner,
     buffer: &mut [u8],
+    temp_buffer: &mut [u8],
     status: alsa::pcm::Status,
     delay_frames: usize,
     data_callback: &mut (dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static),
@@ -842,66 +841,32 @@ fn process_input(
     if sample_format == SampleFormat::I24 {
         // ALSA S24_3LE uses 3 bytes per sample, but I24 expects 4 bytes
         let num_samples = buffer.len() / 3;
-        let needed_size = num_samples * 4;
 
-        I24_CONVERSION_BUFFERS.with(|buffers| {
-            let mut buffers = buffers.borrow_mut();
-            let (ref mut buf1, ref mut buf2, ref mut use_second) = *buffers;
-            
-            // Select current buffer and prepare it
-            let conversion_buf = if *use_second { buf2 } else { buf1 };
-            *use_second = !*use_second; // Toggle for next time
-            
-            // Ensure buffer is large enough
-            if conversion_buf.capacity() < needed_size {
-                conversion_buf.reserve(needed_size - conversion_buf.capacity());
-            }
-            conversion_buf.resize(needed_size, 0);
+        // Convert from packed 24-bit to unpacked 32-bit
+        // Process in chunks for better cache efficiency
+        const CHUNK_SIZE: usize = 64; // Process 64 samples at a time
+        let chunks = num_samples / CHUNK_SIZE;
+        let remainder = num_samples % CHUNK_SIZE;
 
-            // Convert from packed 24-bit to unpacked 32-bit
-            // Process in chunks for better cache efficiency
-            const CHUNK_SIZE: usize = 64; // Process 64 samples at a time
-            let chunks = num_samples / CHUNK_SIZE;
-            let remainder = num_samples % CHUNK_SIZE;
-            
-            unsafe {
-                let src_ptr = buffer.as_ptr();
-                let dst_ptr = conversion_buf.as_mut_ptr();
-                
-                // Process full chunks
-                for chunk in 0..chunks {
-                    let base_src = chunk * CHUNK_SIZE * 3;
-                    let base_dst = chunk * CHUNK_SIZE * 4;
-                    
-                    for i in 0..CHUNK_SIZE {
-                        let src_offset = base_src + i * 3;
-                        let dst_offset = base_dst + i * 4;
-                        
-                        // Copy 3 bytes
-                        *dst_ptr.add(dst_offset) = *src_ptr.add(src_offset);
-                        *dst_ptr.add(dst_offset + 1) = *src_ptr.add(src_offset + 1);
-                        *dst_ptr.add(dst_offset + 2) = *src_ptr.add(src_offset + 2);
-                        
-                        // Sign extension
-                        *dst_ptr.add(dst_offset + 3) = if *src_ptr.add(src_offset + 2) & 0x80 != 0 {
-                            0xFF
-                        } else {
-                            0x00
-                        };
-                    }
-                }
-                
-                // Process remainder
-                let base_src = chunks * CHUNK_SIZE * 3;
-                let base_dst = chunks * CHUNK_SIZE * 4;
-                
-                for i in 0..remainder {
+        unsafe {
+            let src_ptr = buffer.as_ptr();
+            let dst_ptr = temp_buffer.as_mut_ptr();
+
+            // Process full chunks
+            for chunk in 0..chunks {
+                let base_src = chunk * CHUNK_SIZE * 3;
+                let base_dst = chunk * CHUNK_SIZE * 4;
+
+                for i in 0..CHUNK_SIZE {
                     let src_offset = base_src + i * 3;
                     let dst_offset = base_dst + i * 4;
-                    
+
+                    // Copy 3 bytes
                     *dst_ptr.add(dst_offset) = *src_ptr.add(src_offset);
                     *dst_ptr.add(dst_offset + 1) = *src_ptr.add(src_offset + 1);
                     *dst_ptr.add(dst_offset + 2) = *src_ptr.add(src_offset + 2);
+
+                    // Sign extension
                     *dst_ptr.add(dst_offset + 3) = if *src_ptr.add(src_offset + 2) & 0x80 != 0 {
                         0xFF
                     } else {
@@ -910,8 +875,26 @@ fn process_input(
                 }
             }
 
+            // Process remainder
+            let base_src = chunks * CHUNK_SIZE * 3;
+            let base_dst = chunks * CHUNK_SIZE * 4;
+
+            for i in 0..remainder {
+                let src_offset = base_src + i * 3;
+                let dst_offset = base_dst + i * 4;
+
+                *dst_ptr.add(dst_offset) = *src_ptr.add(src_offset);
+                *dst_ptr.add(dst_offset + 1) = *src_ptr.add(src_offset + 1);
+                *dst_ptr.add(dst_offset + 2) = *src_ptr.add(src_offset + 2);
+                *dst_ptr.add(dst_offset + 3) = if *src_ptr.add(src_offset + 2) & 0x80 != 0 {
+                    0xFF
+                } else {
+                    0x00
+                };
+            }
+
             // Create Data from conversion buffer
-            let data_ptr = conversion_buf.as_ptr() as *mut ();
+            let data_ptr = temp_buffer.as_ptr() as *mut ();
             let data = unsafe { Data::from_parts(data_ptr, num_samples, sample_format) };
             let callback = stream_timestamp(&status, stream.creation_instant)?;
             let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
@@ -924,7 +907,7 @@ fn process_input(
             // Call the callback while the conversion buffer is still borrowed
             data_callback(&data, &info);
             Ok(())
-        })
+        }
     } else {
         let data_ptr = buffer.as_mut_ptr() as *mut ();
         let len = buffer.len() / sample_format.sample_size();
@@ -932,9 +915,9 @@ fn process_input(
 
         let callback = stream_timestamp(&status, stream.creation_instant)?;
         let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
-        let capture = callback.sub(delay_duration).expect(
-            "`capture` is earlier than representation supported by `StreamInstant`",
-        );
+        let capture = callback
+            .sub(delay_duration)
+            .expect("`capture` is earlier than representation supported by `StreamInstant`");
         let timestamp = crate::InputStreamTimestamp { callback, capture };
         let info = crate::InputCallbackInfo { timestamp };
         data_callback(&data, &info);
@@ -966,8 +949,11 @@ fn process_output(
         };
 
         // For I24 format, we need to provide a temporary buffer with 4 bytes per sample
-        let mut temp_buffer =
-            if sample_format == SampleFormat::I24 { vec![0u8; len * 4] } else { vec![] };
+        let mut temp_buffer = if sample_format == SampleFormat::I24 {
+            vec![0u8; len * 4]
+        } else {
+            vec![]
+        };
 
         let (data_ptr, actual_len) = if sample_format == SampleFormat::I24 {
             (temp_buffer.as_mut_ptr() as *mut (), len)
