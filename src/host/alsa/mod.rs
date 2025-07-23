@@ -593,6 +593,7 @@ fn input_stream_worker(
     timeout: Option<Duration>,
 ) {
     boost_current_thread_priority(stream.conf.buffer_size, stream.conf.sample_rate);
+    println!("Using buffer size: {:?}", stream.conf.buffer_size);
 
     let mut ctxt = StreamWorkerContext::new(&timeout);
     loop {
@@ -835,7 +836,10 @@ fn process_input(
     delay_frames: usize,
     data_callback: &mut (dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static),
 ) -> Result<(), BackendSpecificError> {
-    stream.channel.io_bytes().readi(buffer)?;
+    if let Err(err) = stream.channel.io_bytes().readi(buffer) {
+        eprintln!("ALSA readi error: {:?}", err);
+        return Err(BackendSpecificError::from(err));
+    }
     let sample_format = stream.sample_format;
 
     let (data, len) = if sample_format == SampleFormat::I24 {
