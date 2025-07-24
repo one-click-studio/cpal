@@ -1,6 +1,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
+use once_cell::unsync::OnceCell;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
@@ -137,6 +139,9 @@ fn write_input_sample(
     sample_rate: u32,
     last_end_pts: Arc<Mutex<Option<cpal::StreamInstant>>>,
 ) {
+    let start = OnceCell::new();
+    let time = start.get_or_init(|| Instant::now());
+
     if sample_len > channels as usize * 1200 {
         println!("WARN: Bump of {} samples", sample_len);
     }
@@ -153,7 +158,7 @@ fn write_input_sample(
             let duration_since_last_frame_nanos = duration_since_last_frame.as_nanos();
             let sample_duration_nanos = (1_000_000_000 / sample_rate) as u128;
             if duration_since_last_frame_nanos > sample_duration_nanos / 2 {
-                println!("WARN: Duration since last frame: {duration_since_last_frame:?}");
+                println!("WARN: Duration since last frame: {duration_since_last_frame:?}. Elapsed time: {:?}", time.elapsed());
             }
         }
     }
