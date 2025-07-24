@@ -124,9 +124,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     stream.play()?;
 
-    let record_duration = 100; // seconds
-    println!("Recording {} seconds...", record_duration);
-    std::thread::sleep(std::time::Duration::from_secs(record_duration));
+    let running_duration = 100; // seconds
+    println!("Running for {} seconds...", running_duration);
+    std::thread::sleep(std::time::Duration::from_secs(running_duration));
     drop(stream);
 
     Ok(())
