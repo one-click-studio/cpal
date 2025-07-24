@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample, SampleFormat};
+use cpal::SampleFormat;
 use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -7,11 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let device = host
         .input_devices()?
-        .find(|d| {
-            d.supported_input_configs()
-                .map(|mut configs| configs.any(|c| c.sample_format() == SampleFormat::I24))
-                .unwrap_or(false)
-        })
+        .find(|d| d.name().unwrap().contains("XR18"))
         .expect("No device supporting I24 found");
 
     println!("Device: {}", device.name()?);
@@ -23,22 +19,106 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let last_end_pts = Arc::new(Mutex::new(None));
 
-    let stream = device
-        .build_input_stream(
-            &config.config(),
-            move |data: &[cpal::I24], info: &cpal::InputCallbackInfo| {
-                write_input_sample::<cpal::I24, i32>(
-                    data,
-                    info,
-                    config.channels(),
-                    config.sample_rate().0,
-                    last_end_pts.clone(),
-                )
-            },
-            err_fn,
-            Some(timeout),
-        )
-        .unwrap();
+    let stream = match config.sample_format() {
+        SampleFormat::I8 => device
+            .build_input_stream(
+                &config.config(),
+                move |data: &[i8], info: &cpal::InputCallbackInfo| {
+                    write_input_sample(
+                        data.len(),
+                        info,
+                        config.channels(),
+                        config.sample_rate().0,
+                        last_end_pts.clone(),
+                    )
+                },
+                err_fn,
+                Some(timeout),
+            )
+            .unwrap(),
+        SampleFormat::I16 => device
+            .build_input_stream(
+                &config.config(),
+                move |data: &[i16], info: &cpal::InputCallbackInfo| {
+                    write_input_sample(
+                        data.len(),
+                        info,
+                        config.channels(),
+                        config.sample_rate().0,
+                        last_end_pts.clone(),
+                    )
+                },
+                err_fn,
+                Some(timeout),
+            )
+            .unwrap(),
+        SampleFormat::I32 => device
+            .build_input_stream(
+                &config.config(),
+                move |data: &[i32], info: &cpal::InputCallbackInfo| {
+                    write_input_sample(
+                        data.len(),
+                        info,
+                        config.channels(),
+                        config.sample_rate().0,
+                        last_end_pts.clone(),
+                    )
+                },
+                err_fn,
+                Some(timeout),
+            )
+            .unwrap(),
+        SampleFormat::F32 => device
+            .build_input_stream(
+                &config.config(),
+                move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                    write_input_sample(
+                        data.len(),
+                        info,
+                        config.channels(),
+                        config.sample_rate().0,
+                        last_end_pts.clone(),
+                    )
+                },
+                err_fn,
+                Some(timeout),
+            )
+            .unwrap(),
+        SampleFormat::F64 => device
+            .build_input_stream(
+                &config.config(),
+                move |data: &[f64], info: &cpal::InputCallbackInfo| {
+                    write_input_sample(
+                        data.len(),
+                        info,
+                        config.channels(),
+                        config.sample_rate().0,
+                        last_end_pts.clone(),
+                    )
+                },
+                err_fn,
+                Some(timeout),
+            )
+            .unwrap(),
+        SampleFormat::I24 => device
+            .build_input_stream(
+                &config.config(),
+                move |data: &[cpal::I24], info: &cpal::InputCallbackInfo| {
+                    write_input_sample(
+                        data.len(),
+                        info,
+                        config.channels(),
+                        config.sample_rate().0,
+                        last_end_pts.clone(),
+                    )
+                },
+                err_fn,
+                Some(timeout),
+            )
+            .unwrap(),
+
+        _ => panic!("Unsupported sample format: {:?}", config.sample_format()),
+    };
 
     stream.play()?;
 
@@ -50,17 +130,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write_input_sample<T, U>(
-    input: &[T],
+fn write_input_sample(
+    sample_len: usize,
     info: &cpal::InputCallbackInfo,
     channels: u16,
     sample_rate: u32,
     last_end_pts: Arc<Mutex<Option<cpal::StreamInstant>>>,
-) where
-    T: Sample,
-    U: Sample + hound::Sample + FromSample<T>,
-{
-    let sample_len = input.len();
+) {
     if sample_len > channels as usize * 1200 {
         println!("WARN: Bump of {} samples", sample_len);
     }
@@ -82,6 +158,6 @@ fn write_input_sample<T, U>(
         }
     }
 
-    println!("Processing {sample_len} samples from {start_pts:?} to {end_pts:?}");
+    // println!("Processing {sample_len} samples from {start_pts:?} to {end_pts:?}");
     *last_end_pts.lock().unwrap() = Some(end_pts);
 }
